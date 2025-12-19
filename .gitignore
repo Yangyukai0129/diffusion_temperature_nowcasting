@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+
+# 排除數據檔
+*.npy
+*.pt
+*.pth
+
+# 排除虛擬環境
+.venv/
+
+# 資料夾
+data/
+output/
+saved_models/
+
+download_nc/*.nc
+download_nc/temperature
+download_nc/u_component_of_wind
+download_nc/v_component_of_wind
+download_nc/0.05
+download_nc/5
+
+/checkpoints
+/generate_data
+/heatwave_event_generate
