@@ -5,8 +5,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
-from unet_ga import UNet, train # 假設這是您的 UNet 架構定義
+from unet_ga import UNet, train  # ✅ 修复：统一从 unet_ga 导入
 from data_utils import prepare_file_list, compute_mean_std, LazyWeatherDataset
+import numpy as np
+import matplotlib.pyplot as plt
 
 # =========================================================
 # <<< 步驟 1: 定義可能的資料目錄列表 >>>
@@ -15,9 +17,10 @@ POSSIBLE_DATA_DIRS = [
     "data/3day_1day", "data/4day_1day", "data/5day_1day", "data/6day_1day",
     "data/7day_1day", "data/8day_1day", "data/9day_1day", "data/10day_1day",
 ]
-# 修改: Input index s 現在是 3 位元，對應 8 種值 (2^3 = 8)。
-# 將 POSSIBLE_DATA_DIRS_MAPPED 設定為包含所有可能的資料目錄。
 POSSIBLE_DATA_DIRS_MAPPED = POSSIBLE_DATA_DIRS
+
+# ✅ 修复：定义为全局常量
+DATA_SHAPE = (9, 42)
 
 # =========================================================
 # <<< 步驟 2: 輔助函數來從目錄名稱解析時間步長 >>>
@@ -37,20 +40,19 @@ def _parse_steps_from_dir(data_dir):
     return cond_steps, target_steps
 
 # <<< 輔助函數，計算最大允許深度 >>>
-def get_max_depth_for_data(data_shape=(9, 42)):
+def get_max_depth_for_data(data_shape=DATA_SHAPE):  # ✅ 使用全局常量
     min_dim = min(data_shape)
     max_depth = 0
     while min_dim >= 2:
         min_dim //= 2
         max_depth += 1
-    return max_depth # 返回池化次數
+    return max_depth
 
 # =========================================================
 # <<< 步驟 3: 定義基因到表型的映射 (Mapping) >>>
 # =========================================================
 # Input index s: 3 bits (b1..b3) -> bin2int(b1..b3) ∈ {0,...,7}
-# 映射到 POSSIBLE_DATA_DIRS_MAPPED 的索引
-S_BITS = 3 # 已修改為 3 位元，以覆蓋 8 個資料目錄
+S_BITS = 3
 
 # Depth d: 3 bits (b4..b6) -> 1 + bin2int(b4..b6) ∈ {1,...,8}
 D_BITS = 3
@@ -62,23 +64,22 @@ PHI_MAP = {
     '10': 64,
     '11': 128
 }
-PHI_INV_MAP = {v: k for k, v in PHI_MAP.items()} # 用於反向映射，突變時可能需要
 
-# μ: {00,01,10,11} → {1,2,4,8} (multiplicative factors M)
+# μ: {01,10,11} → {1,2,4} (multiplicative factors M)
+# 注意：'00' 只用於佔位（超出深度的 g(k)），在有效深度內會被自動修正為 '01'
 MU_MAP = {
-    '00': 1,
-    '01': 2,
-    '10': 4,
-    '11': 8
+    '00': 0,  # 佔位符號（會在 canonicalize 時被修正為 '01'）
+    '01': 1,  # 保持當前倍數（×1）
+    '10': 2,  # 增加2倍（×2）
+    '11': 4   # 增加4倍（×4）
 }
-MU_INV_MAP = {v: k for k, v in MU_MAP.items()} # 用於反向映射，突變時可能需要
 
-G_BITS = 2 # g(k) 的位元數
+G_BITS = 2  # g(k) 的位元數
 
-C_MAX = 1024 # 通道數上限
+C_MAX = 1024  # 通道數上限
 
-# 染色體總長度：3 (S) + 3 (D) + 2*8 (g(1)...g(8)) = 3 + 3 + 16 = 22 bits
-CHROMOSOME_LENGTH = S_BITS + D_BITS + G_BITS * 8 # 已修改為 22 bits
+# 染色體總長度：3 (S) + 3 (D) + 2*8 (g(1)...g(8)) = 22 bits
+CHROMOSOME_LENGTH = S_BITS + D_BITS + G_BITS * 8
 
 def bin_to_int(binary_str):
     return int(binary_str, 2)
@@ -97,34 +98,34 @@ def decode_chromosome(chromosome_str):
     if len(chromosome_str) != CHROMOSOME_LENGTH:
         raise ValueError(f"染色體長度不正確，預期 {CHROMOSOME_LENGTH}，實際 {len(chromosome_str)}")
 
+    # ✅ 安全保護：確保染色體已正規化，避免活躍區出現 '00'
+    # chromosome_str = canonicalize_chromosome(chromosome_str)
+
     # 1. 解碼 Input index s
     s_bin = chromosome_str[0:S_BITS]
-    s_idx = bin_to_int(s_bin) # s = 0..7
-
-    # 映射到資料目錄
-    # 確保 s_idx 不會超出 POSSIBLE_DATA_DIRS_MAPPED 的範圍
+    s_idx = bin_to_int(s_bin)
     s_idx = min(s_idx, len(POSSIBLE_DATA_DIRS_MAPPED) - 1)
     data_dir = POSSIBLE_DATA_DIRS_MAPPED[s_idx]
     cond_steps, target_steps = _parse_steps_from_dir(data_dir)
 
     # 2. 解碼 Depth d
     d_bin = chromosome_str[S_BITS : S_BITS + D_BITS]
-    depth = 1 + bin_to_int(d_bin) # d = 1..8
+    depth = 1 + bin_to_int(d_bin)
 
     # 修正 depth 以符合資料集的最大池化深度
-    data_shape = (9, 42)
-    max_allowed_pooling_steps = get_max_depth_for_data(data_shape)
+    max_allowed_pooling_steps = get_max_depth_for_data(DATA_SHAPE)  # ✅ 使用全局常量
     depth = min(depth, max_allowed_pooling_steps + 1)
-    depth = max(depth, 2) # 最小深度為 2
+    depth = max(depth, 2)
 
     # 3. 解碼 Layer-1 channels C1 (g(1))
     g1_bin = chromosome_str[S_BITS + D_BITS : S_BITS + D_BITS + G_BITS]
-    base_channels = PHI_MAP.get(g1_bin, 16) # 預設值以防出錯
+    base_channels = PHI_MAP.get(g1_bin, 16)
 
-    # 4. 解碼 multiplicative factors M (g(2)...g(8))
-    channel_mults = [1] # 第一層的乘數通常是 1
+    # 4. 解碼 multiplicative factors M (g(2)...g(depth+1))
+    channel_mults = [1]  # 第一層的乘數是 1
     current_mult = 1
-    for k in range(1, depth): # 從 g(2) 到 g(depth)，對應乘數
+
+    for k in range(1, depth):  # k=1..depth-1，对应 g(2)..g(depth)
         start_idx = S_BITS + D_BITS + (k * G_BITS)
         end_idx = start_idx + G_BITS
         gk_bin = chromosome_str[start_idx : end_idx]
@@ -133,17 +134,10 @@ def decode_chromosome(chromosome_str):
         current_mult *= mult_factor
         channel_mults.append(min(current_mult, C_MAX // base_channels if base_channels > 0 else 8))
 
-    # 如果 channel_mults 的長度不足 depth，則補齊
+    # ✅ 修复：移除随机扩展，用确定性逻辑
     while len(channel_mults) < depth:
-        # 這裡的隨機擴展應該是為了確保列表長度，但這部分不應影響基因的解釋。
-        # 在正規化時會將超出深度的 g(k) 設為 '00' (即乘數為 1)。
-        # 因此，這裡的補齊邏輯如果與基因解碼不完全一致，可能會引入不確定性。
-        # 為了簡潔和一致性，確保 channel_mults 恰好為 depth 長度即可。
-        # 最好的做法是讓 decode_chromosome 嚴格按照基因來構建 channel_mults
-        # 且正規化已經處理了超出深度的基因。
-        # 這裡暫時保留您的原有邏輯，但需注意其潛在影響。
-        channel_mults.append(channel_mults[-1] * random.choice([1, 2]))
-        channel_mults[-1] = min(channel_mults[-1], C_MAX // base_channels if base_channels > 0 else 8)
+        # 如果基因没有提供足够的信息，用最后一个值填充
+        channel_mults.append(channel_mults[-1])
 
     # 如果 channel_mults 的長度超過 depth，則截斷
     channel_mults = channel_mults[:depth]
@@ -152,11 +146,10 @@ def decode_chromosome(chromosome_str):
         "data_dir": data_dir,
         "cond_steps": cond_steps,
         "target_steps": target_steps,
-        "in_channels": target_steps, # UNet 輸入是目標序列
-        "out_channels": target_steps, # UNet 輸出是目標序列
-        "cond_channels": cond_steps, # 條件輸入
-        "time_dim": 32, # 通常固定
-
+        "in_channels": target_steps,
+        "out_channels": target_steps,
+        "cond_channels": cond_steps,
+        "time_dim": 32,
         "depth": depth,
         "base_channels": base_channels,
         "channel_mults": channel_mults,
@@ -167,38 +160,30 @@ def decode_chromosome(chromosome_str):
 # <<< 步驟 5: 正規化函數 (canonicalize_chromosome) >>>
 # =========================================================
 def canonicalize_chromosome(chromosome_str):
-    """
-    正規化染色體：如果 d < 8，設定 g(k) = 00 for all k > d。
-    並修正 depth 以確保其在允許範圍內。
-    """
     original_chromosome_list = list(chromosome_str)
 
-    # 提取深度位元
+    # 1. 取得並修正深度 (Source 6, 17)
     d_bin = chromosome_str[S_BITS : S_BITS + D_BITS]
-    depth_val = 1 + bin_to_int(d_bin) # d = 1..8
+    depth_val = 1 + bin_to_int(d_bin)
+    
+    max_allowed = get_max_depth_for_data(DATA_SHAPE)
+    corrected_depth = max(2, min(depth_val, max_allowed + 1))
 
-    # 修正 depth 以符合資料集的最大池化深度
-    data_shape = (9, 42)
-    max_allowed_pooling_steps = get_max_depth_for_data(data_shape)
-    corrected_depth = min(depth_val, max_allowed_pooling_steps + 1)
-    corrected_depth = max(corrected_depth, 2)
-
-    # 如果原始深度與修正後的深度不同，更新染色體中的深度位元
+    # 更新深度位元 (Source 17)
     if depth_val != corrected_depth:
-        corrected_d_bin = int_to_bin(corrected_depth - 1, D_BITS)
-        for i in range(D_BITS):
-            original_chromosome_list[S_BITS + i] = corrected_d_bin[i]
-        depth_val = corrected_depth # 更新為修正後的深度
+        original_chromosome_list[S_BITS : S_BITS + D_BITS] = list(int_to_bin(corrected_depth - 1, D_BITS))
+        depth_val = corrected_depth
 
-    # 對於超出深度的 g(k) 設置為 '00'
-    # 注意這裡的 k 對應 g(k+1) 的索引
-    for k_idx in range(depth_val, 8): # k_idx 從 depth_val (實際修正後的深度) 到 7
-        start_idx = S_BITS + D_BITS + (k_idx * G_BITS)
-        end_idx = start_idx + G_BITS
-        # 確保索引範圍有效
-        if end_idx <= CHROMOSOME_LENGTH:
-            for i in range(G_BITS):
-                original_chromosome_list[start_idx + i] = '0'
+    # 2. 活躍區 (g(2) 到 g(d))：禁止 00，若出現則轉為 01 (Source 8)
+    for k in range(1, depth_val): # k=1 是 g(2)
+        idx = S_BITS + D_BITS + (k * G_BITS)
+        if original_chromosome_list[idx : idx + 2] == ['0', '0']:
+            original_chromosome_list[idx : idx + 2] = ['0', '1']
+
+    # 3. 填充區 (g(d+1) 到 g(8))：強制補 00 (Source 9, 19)
+    for k in range(depth_val, 8):
+        idx = S_BITS + D_BITS + (k * G_BITS)
+        original_chromosome_list[idx : idx + 2] = ['0', '0']
 
     return "".join(original_chromosome_list)
 
@@ -210,20 +195,17 @@ def create_random_individual():
     chromosome_str = ''.join(random.choice('01') for _ in range(CHROMOSOME_LENGTH))
     return canonicalize_chromosome(chromosome_str)
 
-# ... (其餘 evaluate_fitness, crossover, mutate, selection, genetic_algorithm_optimizer 函數保持不變)
-# ... (為了避免冗長，這裡省略了您文件中未修改的部分)
-
 # =========================================================
-# 步驟 7: 適應度函數 (evaluate_fitness) - 使用解碼後的 UNet 架構和 data_dir 基因
+# 步驟 7: 適應度函數 (evaluate_fitness)
 # =========================================================
-phenotype_cache = {} # 用於儲存已計算的表型適應度
+phenotype_cache = {}
 
 def evaluate_fitness(chromosome_str, device):
     """
-    評估單一個體的適應度。現在它接受染色體字串，解碼後再評估。
+    評估單一個體的適應度。
     使用表型緩存來避免重複計算。
     """
-    canonical_chromosome = canonicalize_chromosome(chromosome_str) # 確保輸入是正規化的
+    canonical_chromosome = canonicalize_chromosome(chromosome_str)
 
     if canonical_chromosome in phenotype_cache:
         print(f"--- 從緩存中讀取適應度 (染色體: {canonical_chromosome[:10]}...): {phenotype_cache[canonical_chromosome]:.6f} ---")
@@ -231,12 +213,12 @@ def evaluate_fitness(chromosome_str, device):
 
     # 解碼染色體以獲取配置
     individual_config = decode_chromosome(canonical_chromosome)
-    
+
     data_dir = individual_config["data_dir"]
-    
+
     print(f"\n--- 評估個體 (資料: {data_dir}) ---")
     print(f"    UNet 架構: depth={individual_config['depth']}, base_channels={individual_config['base_channels']}, channel_mults={individual_config['channel_mults']}")
-    
+
     try:
         # 1. 根據個體選擇的 data_dir 載入資料
         train_files, _ = prepare_file_list(data_dir)
@@ -245,31 +227,31 @@ def evaluate_fitness(chromosome_str, device):
             fitness = -float('inf')
             phenotype_cache[canonical_chromosome] = fitness
             return fitness
-            
+
         computed_stats = compute_mean_std(train_files)
         cond_mean, cond_std, target_mean, target_std = computed_stats
-        
+
         train_dataset = LazyWeatherDataset(train_files, cond_mean, cond_std, target_mean, target_std)
 
         # 2. 建立 UNet 模型與訓練 (代理)
-        model = UNet(individual_config).to(device) 
-        
+        model = UNet(individual_config).to(device)
+
         subset_indices = random.sample(range(len(train_dataset)), k=min(len(train_dataset), 500))
         subset = Subset(train_dataset, subset_indices)
         proxy_loader = DataLoader(subset, batch_size=16, shuffle=True, num_workers=2)
 
         optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-        criterion = nn.MSELoss() 
-        
-        train_loss_history, _, _, _, _, _ = train( 
+        criterion = nn.MSELoss()
+
+        train_loss_history, _, _, _, _, _ = train(
             model, proxy_loader, num_epochs=10, device=device,
-            optimizer=optimizer, criterion=criterion, 
-            train_loss_history=[], use_checkpoint=False 
+            optimizer=optimizer, criterion=criterion,
+            train_loss_history=[], use_checkpoint=False
         )
-        
-        final_mse = train_loss_history[-1] 
-        fitness = -final_mse**0.5  
-        
+
+        final_mse = train_loss_history[-1]
+        fitness = -final_mse**0.5  # 使用負 RMSE 作為適應度
+
         del model, optimizer, proxy_loader, train_dataset, subset
         torch.cuda.empty_cache()
 
@@ -280,7 +262,7 @@ def evaluate_fitness(chromosome_str, device):
     except Exception as e:
         print(f"!!! 評估失敗 (資料: {data_dir}, 架構: depth={individual_config.get('depth', 'N/A')}, base_ch={individual_config.get('base_channels', 'N/A')}): {e}")
         import traceback
-        traceback.print_exc() 
+        traceback.print_exc()
         fitness = -float('inf')
         phenotype_cache[canonical_chromosome] = fitness
         return fitness
@@ -289,9 +271,7 @@ def evaluate_fitness(chromosome_str, device):
 # 步驟 8: 交叉和突變操作 (bit-level)
 # =========================================================
 def crossover(parent1_chromosome, parent2_chromosome):
-    """
-    位元級 1-2 點交叉。
-    """
+    """位元級 1-2 點交叉。"""
     if len(parent1_chromosome) != CHROMOSOME_LENGTH or len(parent2_chromosome) != CHROMOSOME_LENGTH:
         raise ValueError("父染色體長度不匹配。")
 
@@ -300,25 +280,22 @@ def crossover(parent1_chromosome, parent2_chromosome):
 
     # 選擇 1 或 2 個交叉點
     num_crossover_points = random.choice([1, 2])
-    
+
     if num_crossover_points == 1:
         point = random.randint(1, CHROMOSOME_LENGTH - 1)
         child1_chromosome_list[:point], child2_chromosome_list[:point] = \
             child2_chromosome_list[:point], child1_chromosome_list[:point]
-    else: # 2 points
+    else:  # 2 points
         point1 = random.randint(1, CHROMOSOME_LENGTH - 2)
         point2 = random.randint(point1 + 1, CHROMOSOME_LENGTH - 1)
-        
-        # 交換中間部分
+
         child1_chromosome_list[point1:point2], child2_chromosome_list[point1:point2] = \
             child2_chromosome_list[point1:point2], child1_chromosome_list[point1:point2]
-    
+
     return "".join(child1_chromosome_list), "".join(child2_chromosome_list)
 
 def mutate(chromosome_str, mutation_rate):
-    """
-    位元翻轉突變。
-    """
+    """位元翻轉突變。"""
     mutated_chromosome_list = list(chromosome_str)
     for i in range(CHROMOSOME_LENGTH):
         if random.random() < mutation_rate:
@@ -326,121 +303,49 @@ def mutate(chromosome_str, mutation_rate):
     return "".join(mutated_chromosome_list)
 
 def selection(population_with_fitness, num_parents):
-    """錦標賽選擇 (與之前相同，但操作的是染色體字串)"""
+    """錦標賽選擇"""
     valid_population = [item for item in population_with_fitness if item[1] != -float('inf')]
-    
+
     if not valid_population:
         print("!!! 警告: 所有個體適應度均為 -inf，將從原始種群隨機選擇父母。")
-        # 這裡需要返回染色體字串，而不是整個 (config, fitness) 元組
         return random.sample([item[0] for item in population_with_fitness], k=min(num_parents, len(population_with_fitness)))
 
     parents = []
-    k_tournament = min(3, len(valid_population)) 
+    k_tournament = min(3, len(valid_population))
 
     for _ in range(num_parents):
-        if len(valid_population) < k_tournament: 
+        if len(valid_population) < k_tournament:
             tournament = valid_population
         else:
             tournament = random.sample(valid_population, k=k_tournament)
-        
+
         winner = max(tournament, key=lambda x: x[1])
-        parents.append(winner[0]) # 父母是染色體字串
+        parents.append(winner[0])
     return parents
 
-def genetic_algorithm_optimizer(
-    population_size=10, 
-    generations=5, 
-    mutation_rate=0.05, # 位元翻轉突變率通常較低
-    num_parents_to_select=4, 
-    device="cuda"
-):
-    print(f"=== 開始遺傳演算法最佳化 UNet 架構與資料集選擇 (共 {generations} 代) ===")
-    
-    # 步驟 1) 初始化 N 隨機 21 位元染色體；正規化。
-    population = [create_random_individual() for _ in range(population_size)]
-    
-    best_chromosome_so_far = None
-    best_fitness_so_far = -float('inf')
-
-    for gen in range(generations):
-        print(f"\n--- 第 {gen+1}/{generations} 代 ---")
-        population_with_fitness = []
-        for chromosome in population:
-            # 步驟 2.1) 解碼 (I, d, c) 並計算適應度 F。
-            fitness = evaluate_fitness(chromosome, device)
-            population_with_fitness.append((chromosome, fitness))
-            
-            if fitness > best_fitness_so_far:
-                best_fitness_so_far = fitness
-                best_chromosome_so_far = chromosome # 儲存染色體字串
-
-        population_with_fitness.sort(key=lambda x: x[1], reverse=True)
-        print("\n=== 本代最佳個體 ===")
-        decoded_best_config = decode_chromosome(population_with_fitness[0][0])
-        print(f"資料集: {decoded_best_config['data_dir']}, UNet 架構: depth={decoded_best_config['depth']}, base_ch={decoded_best_config['base_channels']}, 適應度: {population_with_fitness[0][1]:.6f}")
-
-        # 步驟 2.2) 錦標賽選擇 → 交配池。
-        parents = selection(population_with_fitness, num_parents_to_select)
-
-        next_population = []
-        # 步驟 2.4) 通過精英策略 + 最佳後代形成下一代種群。
-        num_elites = 2 # 保留最佳的精英
-        for i in range(min(num_elites, len(population_with_fitness))):
-            next_population.append(population_with_fitness[i][0])
-
-        while len(next_population) < population_size:
-            # 步驟 2.3) 位元級 1-2 點交叉 → 後代；位元翻轉突變。
-            p1_chrom, p2_chrom = random.sample(parents, 2)
-            child1_chrom, child2_chrom = crossover(p1_chrom, p2_chrom)
-            
-            mutated_child1_chrom = mutate(child1_chrom, mutation_rate)
-            mutated_child2_chrom = mutate(child2_chrom, mutation_rate)
-
-            # 步驟 2.4) 正規化；
-            next_population.append(canonicalize_chromosome(mutated_child1_chrom))
-            if len(next_population) < population_size: # 確保不超出種群大小
-                next_population.append(canonicalize_chromosome(mutated_child2_chrom))
-        
-        population = next_population
-
-    print("\n=== 遺傳演算法結束 ===")
-    final_best_config = decode_chromosome(best_chromosome_so_far)
-    print(f"最終選定的最佳配置: {final_best_config}, 最佳適應度: {best_fitness_so_far:.6f}")
-    return final_best_config
-
-import numpy as np # <<< 新增: 用於計算平均值
-import matplotlib.pyplot as plt # <<< 新增: 用於繪圖
-
 # =========================================================
-# <<< 新增: 繪製收斂圖的函數 >>>
+# <<< 繪製收斂圖的函數 >>>
 # =========================================================
 def plot_convergence(history):
-    """
-    根據紀錄的歷史數據繪製 GA 收斂圖。
-    """
+    """根據紀錄的歷史數據繪製 GA 收斂圖。"""
     generations = range(len(history['overall_best_rmse']))
 
     plt.figure(figsize=(12, 8))
-    
-    # 繪製歷代最佳RMSE (因優生學而單調遞減)
+
     plt.plot(generations, history['overall_best_rmse'], 'r-o', linewidth=2, markersize=8, label='Overall Best RMSE (Elitism)')
-    
-    # 繪製當代最佳RMSE
     plt.plot(generations, history['best_rmse_per_gen'], 'g--^', alpha=0.7, label='Generation\'s Best RMSE')
-    
-    # 繪製當代平均RMSE
     plt.plot(generations, history['avg_rmse_per_gen'], 'b:s', alpha=0.6, label='Generation\'s Average RMSE')
-    
+
     plt.title('Genetic Algorithm Convergence Curve', fontsize=16)
     plt.xlabel('Generation', fontsize=12)
     plt.ylabel('RMSE (Lower is Better)', fontsize=12)
-    plt.xticks(generations) # 確保每個世代都有刻度
+    plt.xticks(generations)
     plt.grid(True, which='both', linestyle='--', linewidth=0.5)
     plt.legend(fontsize=10)
     plt.show()
 
 # =========================================================
-# <<< 修改: 主要的基因演算法流程 >>>
+# ✅ 修复：移除重复定义，只保留一个完整版本
 # =========================================================
 def genetic_algorithm_optimizer(
     population_size=10,
@@ -450,13 +355,15 @@ def genetic_algorithm_optimizer(
     device="cuda"
 ):
     print(f"=== 開始遺傳演算法最佳化 UNet 架構與資料集選擇 (共 {generations} 代) ===")
-    
+
+    # ✅ 修复：注释改为 22 位元
+    # 步驟 1) 初始化 N 隨機 22 位元染色體；正規化。
     population = [create_random_individual() for _ in range(population_size)]
-    
+
     best_chromosome_so_far = None
     best_fitness_so_far = -float('inf')
 
-    # <<< 新增: 用於儲存繪圖數據的歷史紀錄 >>>
+    # 用於儲存繪圖數據的歷史紀錄
     history = {
         "overall_best_rmse": [],
         "best_rmse_per_gen": [],
@@ -469,35 +376,29 @@ def genetic_algorithm_optimizer(
         for chromosome in population:
             fitness = evaluate_fitness(chromosome, device)
             population_with_fitness.append((chromosome, fitness))
-            
+
             if fitness > best_fitness_so_far:
                 best_fitness_so_far = fitness
                 best_chromosome_so_far = chromosome
 
-        # --- 開始為繪圖紀錄數據 ---
-        # 從 population_with_fitness 中提取所有有效的適應度值
+        # 紀錄數據用於繪圖
         valid_fitness_values = [f for _, f in population_with_fitness if f != -float('inf')]
-        
+
         if not valid_fitness_values:
-            # 如果所有個體都評估失敗，紀錄一個極差的值
             current_best_rmse = float('inf')
             current_avg_rmse = float('inf')
         else:
-            # Fitness 是 -RMSE，所以要轉回正的 RMSE (越小越好)
             rmse_values = [-f for f in valid_fitness_values]
             current_best_rmse = min(rmse_values)
             current_avg_rmse = np.mean(rmse_values)
 
-        # 歷代最佳 RMSE (因優生學策略，此值只會下降或持平)
         overall_best_rmse_so_far = -best_fitness_so_far
-        
-        # 將本代的數據加入歷史紀錄
+
         history["overall_best_rmse"].append(overall_best_rmse_so_far)
         history["best_rmse_per_gen"].append(current_best_rmse)
         history["avg_rmse_per_gen"].append(current_avg_rmse)
-        
+
         print(f"\n本代統計: 最佳RMSE={current_best_rmse:.6f}, 平均RMSE={current_avg_rmse:.6f}, 歷代最佳RMSE={overall_best_rmse_so_far:.6f}")
-        # --- 結束紀錄數據 ---
 
         population_with_fitness.sort(key=lambda x: x[1], reverse=True)
         print("\n=== 本代最佳個體 ===")
@@ -518,30 +419,30 @@ def genetic_algorithm_optimizer(
             next_population.append(canonicalize_chromosome(mutated_child1_chrom))
             if len(next_population) < population_size:
                 next_population.append(canonicalize_chromosome(mutated_child2_chrom))
-        
+
         population = next_population
 
-    # <<< 新增: 在演算法結束後呼叫繪圖函數 >>>
+    # 在演算法結束後呼叫繪圖函數
     print("\n=== 繪製收斂曲線圖 ===")
     plot_convergence(history)
 
     print("\n=== 遺傳演算法結束 ===")
     final_best_config = decode_chromosome(best_chromosome_so_far)
     print(f"最終選定的最佳配置: {final_best_config}, 最佳適應度: {best_fitness_so_far:.6f}")
-    
+
     return final_best_config
 
 # =========================================================
-# <<< 主程式入口 (不需修改) >>>
+# <<< 主程式入口 >>>
 # =========================================================
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用設備: {device}")
 
-    # 執行 GA 最佳化，圖表會自動顯示
+    # 執行 GA 最佳化
     best_config = genetic_algorithm_optimizer(
-        population_size=10, 
-        generations=5, 
+        population_size=10,
+        generations=20,
         mutation_rate=0.05,
         num_parents_to_select=4,
         device=device
