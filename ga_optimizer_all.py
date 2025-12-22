@@ -5,8 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
-from unet_ga import UNet # 假設這是您的 UNet 架構定義
-from unet import train
+from unet_ga import UNet, train # 假設這是您的 UNet 架構定義
 from data_utils import prepare_file_list, compute_mean_std, LazyWeatherDataset
 
 # =========================================================
