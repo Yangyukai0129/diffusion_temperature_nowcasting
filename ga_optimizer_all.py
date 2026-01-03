@@ -119,20 +119,30 @@ def decode_chromosome(chromosome_str):
 
     # 3. 解碼 Layer-1 channels C1 (g(1))
     g1_bin = chromosome_str[S_BITS + D_BITS : S_BITS + D_BITS + G_BITS]
-    base_channels = PHI_MAP.get(g1_bin, 16)
+    base_channels = PHI_MAP.get(g1_bin, 16) # g(1) 必為活躍區 
 
-    # 4. 解碼 multiplicative factors M (g(2)...g(depth+1))
-    channel_mults = [1]  # 第一層的乘數是 1
+    # 4. 解碼倍率因子 M (g(2)...g(depth))
+    channel_mults = [1]  # 第一層固定倍率
     current_mult = 1
 
-    for k in range(1, depth):  # k=1..depth-1，对应 g(2)..g(depth)
+    # ✅ 關鍵點：range(1, depth) 確保只走訪活躍層 
+    for k in range(1, depth): 
         start_idx = S_BITS + D_BITS + (k * G_BITS)
-        end_idx = start_idx + G_BITS
-        gk_bin = chromosome_str[start_idx : end_idx]
+        gk_bin = chromosome_str[start_idx : start_idx + G_BITS]
 
-        mult_factor = MU_MAP.get(gk_bin, 1)
+        # 這裡從 MU_MAP 取得倍率
+        mult_factor = MU_MAP.get(gk_bin, 1) 
+        
+        # ✅ 安全檢查：如果因為突變或其他原因導致活躍區出現 '00'
+        # 強制將倍率設為 1，防止 current_mult 變為 0 (導致模型崩潰) 
+        if mult_factor == 0:
+            mult_factor = 1
+            
         current_mult *= mult_factor
-        channel_mults.append(min(current_mult, C_MAX // base_channels if base_channels > 0 else 8))
+        
+        # 限制上限 C_MAX 
+        safe_max_mult = max(1, C_MAX // base_channels)
+        channel_mults.append(min(current_mult, safe_max_mult))
 
     # ✅ 修复：移除随机扩展，用确定性逻辑
     while len(channel_mults) < depth:
